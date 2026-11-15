@@ -1,0 +1,322 @@
+name: Build Nothing Phone (2a) Kernel with KernelSU-Next & SuSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "NothingOSS Kernel Branch"
+        required: true
+        type: choice
+        options:
+          - "mt6886/Pacman/16b"
+          - "mt6886/Pacman/v"
+          - "mt6886/Pacman/t"
+        default: "mt6886/Pacman/16b"
+      ksu_version:
+        description: "KernelSU-Next tag or commit (v3.4.2 = uapi v5)"
+        required: true
+        type: string
+        default: "v3.4.2"
+      enable_susfs:
+        description: "Enable SuSFS 2.x (anti-detection)"
+        required: true
+        type: boolean
+        default: true
+      susfs_branch:
+        description: "SuSFS branch"
+        required: true
+        type: string
+        default: "gki-android13-5.15"
+      hook_type:
+        description: "Hooking method"
+        required: true
+        type: choice
+        options:
+          - "inline"
+          - "tracepoint"
+        default: "inline"
+      clang_version:
+        description: "Android Prebuilt Clang Version"
+        required: true
+        type: string
+        default: "r450784e"
+      custom_localversion:
+        description: "Custom localversion suffix"
+        required: false
+        type: string
+        default: "-Pacman-KSUN-SuSFS"
+      make_release:
+        description: "Publish GitHub Release on completion"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: Build Pacman MT6886 5.15
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Free Runner Disk Space
+        run: |
+          echo "=== Freeing disk space ==="
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -a -f || true
+          df -h
+
+      - name: Checkout Builder Repository
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev lz4 cpio kmod git curl \
+            zip unzip file dwarves python3 tar wget jq rsync
+
+      - name: Setup Swap Memory
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=16384
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Fetch Android Clang ${{ inputs.clang_version }}
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/clang
+          CV="clang-${{ inputs.clang_version }}"
+          got=0
+          for BR in android13-release android14-release main master; do
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/$BR/$CV.tar.gz"
+            echo "Attempting to fetch $CV from branch $BR..."
+            if curl -fsSL --retry 3 --retry-delay 2 "$URL" -o clang.tar.gz && file clang.tar.gz | grep -q gzip; then
+              tar -xzf clang.tar.gz -C $GITHUB_WORKSPACE/clang && got=1 && echo "Clang extracted successfully from $BR!" && break
+            fi
+            rm -f clang.tar.gz
+          done
+
+          if [ "$got" != "1" ]; then
+            echo "Tarball download failed, falling back to git shallow clone..."
+            git clone --depth=1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 -b main $GITHUB_WORKSPACE/clang_git
+            cp -r $GITHUB_WORKSPACE/clang_git/$CV/* $GITHUB_WORKSPACE/clang/
+          fi
+
+          if [ -f "$GITHUB_WORKSPACE/clang/bin/ld.lld" ] && [ ! -f "$GITHUB_WORKSPACE/clang/bin/ld" ]; then
+            ln -sf ld.lld "$GITHUB_WORKSPACE/clang/bin/ld"
+          fi
+
+          echo "$GITHUB_WORKSPACE/clang/bin" >> $GITHUB_PATH
+          $GITHUB_WORKSPACE/clang/bin/clang --version
+
+      - name: Clone Nothing Phone (2a) Kernel Source
+        run: |
+          echo "Cloning NothingOSS kernel 5.15 branch ${{ inputs.kernel_branch }}..."
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" https://github.com/NothingOSS/android_kernel_5.15_nothing_mt6886.git $GITHUB_WORKSPACE/kernel
+          cd $GITHUB_WORKSPACE/kernel
+          echo "Latest commit:"
+          git log -1 --oneline
+
+      - name: Integrate KernelSU-Next (${{ inputs.ksu_version }})
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "=== Integrating KernelSU-Next ==="
+          git clone https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+          cd KernelSU-Next
+          git checkout "${{ inputs.ksu_version }}"
+          echo "KernelSU-Next commit: $(git rev-parse HEAD)"
+
+          if [ -f "uapi/supercall.h" ]; then
+            echo "Checking KERNEL_SU_UAPI_VERSION in uapi/supercall.h:"
+            grep "KERNEL_SU_UAPI_VERSION" uapi/supercall.h || true
+          fi
+
+          cd $GITHUB_WORKSPACE/kernel
+          ln -sf "$(pwd)/KernelSU-Next/kernel" "drivers/kernelsu"
+          grep -q "kernelsu" drivers/Makefile || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> drivers/Makefile
+          grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          # Soften config guard if needed
+          if [ -f "drivers/kernelsu/Kbuild" ] && grep -q 'KernelSU requires either CONFIG_KPROBES' "drivers/kernelsu/Kbuild"; then
+            sed -i 's/$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/$(warning "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/' "drivers/kernelsu/Kbuild"
+          fi
+
+      - name: Integrate SuSFS 2.x
+        if: inputs.enable_susfs == true
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "=== Integrating SuSFS 2.x ==="
+
+          # Copy core susfs files from local repository patches
+          cp -r $GITHUB_WORKSPACE/patches/fs/* ./fs/
+          cp -r $GITHUB_WORKSPACE/patches/include/linux/* ./include/linux/
+
+          if [ "${{ inputs.hook_type }}" = "inline" ]; then
+            echo "Applying SuSFS 2.x inline hook kernel patch..."
+            patch -p1 --fuzz=3 < $GITHUB_WORKSPACE/patches/50_add_susfs_in_gki-android13-5.15.patch || {
+              echo "Standard patch had warnings/fuzz, checking rejects..."
+              find . -name "*.rej" -exec cat {} + || true
+            }
+
+            echo "Applying KernelSU-Next SuSFS patch..."
+            cd KernelSU-Next
+            patch -p1 --fuzz=3 < $GITHUB_WORKSPACE/patches/10_enable_susfs_for_ksu.patch || {
+              echo "KSU patch had fuzz or warnings, checking..."
+              find . -name "*.rej" -exec cat {} + || true
+            }
+            cd ..
+          fi
+
+          # Clean any patch reject or orig files
+          find . -name "*.orig" -delete
+          find . -name "*.rej" -delete
+          echo "SuSFS integration complete."
+
+      - name: Configure Kernel
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+
+          # Clean dirty marker
+          sed -i 's/ -dirty//g; s/-dirty//g; s/echo "+"/echo ""/g' scripts/setlocalversion || true
+
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+
+          cat << 'EOF' >> $DEFCONFIG
+          # KernelSU-Next Configuration
+          CONFIG_KSU=y
+          CONFIG_WERROR=n
+          EOF
+
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            cat << 'EOF' >> $DEFCONFIG
+          # SuSFS 2.x Configuration
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          EOF
+          fi
+
+          if [ "${{ inputs.hook_type }}" = "tracepoint" ]; then
+            cat << 'EOF' >> $DEFCONFIG
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_TRACEPOINT_HOOK=y
+          EOF
+          fi
+
+          if [ -n "${{ inputs.custom_localversion }}" ]; then
+            echo "CONFIG_LOCALVERSION=\"${{ inputs.custom_localversion }}\"" >> $DEFCONFIG
+          fi
+
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+            gki_defconfig
+
+          echo "=== Final .config KSU and SuSFS parameters ==="
+          grep -E "CONFIG_KSU|CONFIG_SUSFS|CONFIG_LOCALVERSION" out/.config || true
+
+      - name: Compile Kernel
+        run: |
+          cd $GITHUB_WORKSPACE/kernel
+          echo "=== Starting Kernel Compilation ==="
+
+          make -j$(nproc --all) \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KCFLAGS="-Wno-error" \
+            Image Image.lz4 Image.gz
+
+          echo "Build finished! Inspecting generated outputs:"
+          ls -la out/arch/arm64/boot/
+
+      - name: Package with AnyKernel3
+        run: |
+          echo "=== Packaging Flashable AnyKernel3 ZIP ==="
+          git clone https://github.com/osm0sis/AnyKernel3.git $GITHUB_WORKSPACE/AnyKernel3
+          rm -rf $GITHUB_WORKSPACE/AnyKernel3/.git
+
+          cp $GITHUB_WORKSPACE/anykernel.sh $GITHUB_WORKSPACE/AnyKernel3/anykernel.sh
+          cp $GITHUB_WORKSPACE/banner $GITHUB_WORKSPACE/AnyKernel3/banner
+
+          BOOT_DIR="$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot"
+          if [ -f "$BOOT_DIR/Image.lz4" ]; then
+            cp "$BOOT_DIR/Image.lz4" $GITHUB_WORKSPACE/AnyKernel3/Image.lz4
+          fi
+          if [ -f "$BOOT_DIR/Image.gz" ]; then
+            cp "$BOOT_DIR/Image.gz" $GITHUB_WORKSPACE/AnyKernel3/Image.gz
+          fi
+          if [ -f "$BOOT_DIR/Image" ]; then
+            cp "$BOOT_DIR/Image" $GITHUB_WORKSPACE/AnyKernel3/Image
+          fi
+
+          mkdir -p $GITHUB_WORKSPACE/output
+          ZIP_NAME="AnyKernel3-Nothing-Phone-2a-Pacman-KSUN-SuSFS-$(date +%Y%m%d_%H%M%S).zip"
+          cd $GITHUB_WORKSPACE/AnyKernel3
+          zip -r9 "$GITHUB_WORKSPACE/output/$ZIP_NAME" * -x README.md *placeholder
+          cd $GITHUB_WORKSPACE
+
+          # Copy raw images for direct fastboot flashing
+          cp "$BOOT_DIR/Image" "$GITHUB_WORKSPACE/output/Image" || true
+          cp "$BOOT_DIR/Image.lz4" "$GITHUB_WORKSPACE/output/Image.lz4" || true
+          cp "$BOOT_DIR/Image.gz" "$GITHUB_WORKSPACE/output/Image.gz" || true
+          cp "$GITHUB_WORKSPACE/kernel/out/.config" "$GITHUB_WORKSPACE/output/kernel_config.txt" || true
+
+          cd $GITHUB_WORKSPACE/output
+          sha256sum * > sha256sums.txt
+          cat sha256sums.txt
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nothing-Phone-2a-Pacman-Kernel-${{ github.run_id }}
+          path: output/
+
+      - name: Create GitHub Release
+        if: inputs.make_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kernel-pacman-v5.15-${{ github.run_number }}
+          name: "Nothing Phone (2a) Kernel 5.15 with KernelSU-Next & SuSFS 2.x"
+          draft: false
+          prerelease: false
+          body: |
+            ## Nothing Phone (2a) [Pacman / MT6886] Custom Kernel 5.15
+            
+            Built with GitHub Actions.
+            
+            ### Specifications:
+            - **Device:** Nothing Phone (2a) / Nothing Phone (2a) Plus (MT6886 / Dimensity 7200 Pro)
+            - **Base Source:** `NothingOSS/android_kernel_5.15_nothing_mt6886` (`${{ inputs.kernel_branch }}`)
+            - **KernelSU-Next:** `${{ inputs.ksu_version }}` (UAPI v5)
+            - **SuSFS:** 2.x (`${{ inputs.susfs_branch }}`)
+            - **Hook Method:** `${{ inputs.hook_type }}`
+            - **Compiler:** Android Clang `${{ inputs.clang_version }}`
+            
+            ### Included Files:
+            - `${{ env.ZIP_NAME }}`: Flashable AnyKernel3 zip (via Kernel Flasher app or recovery).
+            - `Image`, `Image.lz4`, `Image.gz`: Raw compiled kernel images.
+            - `kernel_config.txt`: Kernel configuration file.
+            - `sha256sums.txt`: Checksums for verification.
+            
+            ### Flashing Instructions:
+            1. **Recommended (Kernel Flasher app):** Install [Kernel Flasher](https://github.com/capntrips/KernelFlasher), select the `AnyKernel3-*.zip` or `Image.lz4`, and flash to boot partition.
+            2. **Fastboot:** Flash boot image or repack into stock `boot.img` using `magiskboot`.
+          files: |
+            output/*
