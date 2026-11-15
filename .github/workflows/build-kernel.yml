@@ -40,6 +40,15 @@ on:
         required: true
         type: string
         default: "r450784e"
+      lto_mode:
+        description: "LTO Optimization Mode (thin: recommended for CI, none: fastest link, full: slow/hang prone)"
+        required: true
+        type: choice
+        options:
+          - "thin"
+          - "none"
+          - "full"
+        default: "thin"
       custom_localversion:
         description: "Custom localversion suffix"
         required: false
@@ -201,6 +210,22 @@ jobs:
 
           # Disable IKHEADERS to avoid packaging errors and save memory
           sed -i 's/CONFIG_IKHEADERS=y/CONFIG_IKHEADERS=n/' $DEFCONFIG
+
+          # Configure LTO mode (default gki_defconfig uses Full LTO which hangs on 2-vCPU runners)
+          sed -i '/CONFIG_LTO_CLANG_FULL/d' $DEFCONFIG
+          sed -i '/CONFIG_LTO_CLANG_THIN/d' $DEFCONFIG
+          sed -i '/CONFIG_LTO_NONE/d' $DEFCONFIG
+
+          if [ "${{ inputs.lto_mode }}" = "thin" ]; then
+            echo "Enabling ThinLTO..."
+            echo "CONFIG_LTO_CLANG_THIN=y" >> $DEFCONFIG
+          elif [ "${{ inputs.lto_mode }}" = "none" ]; then
+            echo "Disabling LTO..."
+            echo "CONFIG_LTO_NONE=y" >> $DEFCONFIG
+          else
+            echo "Using Full LTO..."
+            echo "CONFIG_LTO_CLANG_FULL=y" >> $DEFCONFIG
+          fi
 
           cat << 'EOF' >> $DEFCONFIG
           # KernelSU-Next Configuration
