@@ -143,6 +143,14 @@ jobs:
             sed -i 's/$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/$(warning "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/' "drivers/kernelsu/Kbuild"
           fi
 
+          # Fix avc spoof declarations in core/init.c if missing
+          if [ -f "drivers/kernelsu/core/init.c" ] && grep -q "ksu_avc_spoof_init" drivers/kernelsu/core/init.c; then
+            if ! grep -q "extern void ksu_avc_spoof_init" drivers/kernelsu/core/init.c; then
+              echo "Declaring missing ksu_avc_spoof_init/exit in core/init.c..."
+              sed -i 's/extern void ksu_avc_spoof_late_init(void);/extern void ksu_avc_spoof_late_init(void);\nextern void ksu_avc_spoof_init(void);\nextern void ksu_avc_spoof_exit(void);/' drivers/kernelsu/core/init.c
+            fi
+          fi
+
       - name: Integrate SuSFS 2.x
         if: inputs.enable_susfs == true
         run: |
@@ -158,7 +166,7 @@ jobs:
             patch -p1 --fuzz=3 < $GITHUB_WORKSPACE/patches/50_add_susfs_in_gki-android13-5.15.patch
 
             # Check if KernelSU checkout already bundles SuSFS support
-            if [ -d "KernelSU-Next" ] && grep -q 'CONFIG_KSU_SUSFS' "KernelSU-Next/kernel/Kconfig"; then
+            if [ -d "KernelSU-Next" ] && grep -q 'KSU_SUSFS' "KernelSU-Next/kernel/Kconfig"; then
               echo "KernelSU-Next checkout already bundles SuSFS support in-tree; skipping 10_enable_susfs_for_ksu.patch."
             else
               echo "Applying KernelSU-Next SuSFS patch..."
