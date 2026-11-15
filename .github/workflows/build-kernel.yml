@@ -12,21 +12,21 @@ on:
           - "mt6886/Pacman/v"
           - "mt6886/Pacman/t"
         default: "mt6886/Pacman/16b"
-      ksu_version:
-        description: "KernelSU-Next tag or commit (v3.4.2 = uapi v5)"
+      ksu_repo:
+        description: "KernelSU-Next Git Repository"
         required: true
         type: string
-        default: "v3.4.2"
+        default: "https://github.com/pershoot/KernelSU-Next.git"
+      ksu_branch:
+        description: "KernelSU-Next branch or tag (dev-susfs bundles in-tree SuSFS v2.4.0 & uapi v5+)"
+        required: true
+        type: string
+        default: "dev-susfs"
       enable_susfs:
         description: "Enable SuSFS 2.x (anti-detection)"
         required: true
         type: boolean
         default: true
-      susfs_branch:
-        description: "SuSFS branch"
-        required: true
-        type: string
-        default: "gki-android13-5.15"
       hook_type:
         description: "Hooking method"
         required: true
@@ -120,13 +120,12 @@ jobs:
           echo "Latest commit:"
           git log -1 --oneline
 
-      - name: Integrate KernelSU-Next (${{ inputs.ksu_version }})
+      - name: Integrate KernelSU-Next (${{ inputs.ksu_branch }})
         run: |
           cd $GITHUB_WORKSPACE/kernel
           echo "=== Integrating KernelSU-Next ==="
-          git clone https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+          git clone --depth=1 -b "${{ inputs.ksu_branch }}" "${{ inputs.ksu_repo }}" KernelSU-Next
           cd KernelSU-Next
-          git checkout "${{ inputs.ksu_version }}"
           echo "KernelSU-Next commit: $(git rev-parse HEAD)"
 
           if [ -f "uapi/supercall.h" ]; then
@@ -151,23 +150,22 @@ jobs:
           echo "=== Integrating SuSFS 2.x ==="
 
           # Copy core susfs files from local repository patches
-          cp -r $GITHUB_WORKSPACE/patches/fs/* ./fs/
-          cp -r $GITHUB_WORKSPACE/patches/include/linux/* ./include/linux/
+          cp -v $GITHUB_WORKSPACE/patches/fs/* ./fs/
+          cp -v $GITHUB_WORKSPACE/patches/include/linux/* ./include/linux/
 
           if [ "${{ inputs.hook_type }}" = "inline" ]; then
             echo "Applying SuSFS 2.x inline hook kernel patch..."
-            patch -p1 --fuzz=3 < $GITHUB_WORKSPACE/patches/50_add_susfs_in_gki-android13-5.15.patch || {
-              echo "Standard patch had warnings/fuzz, checking rejects..."
-              find . -name "*.rej" -exec cat {} + || true
-            }
+            patch -p1 --fuzz=3 < $GITHUB_WORKSPACE/patches/50_add_susfs_in_gki-android13-5.15.patch
 
-            echo "Applying KernelSU-Next SuSFS patch..."
-            cd KernelSU-Next
-            patch -p1 --fuzz=3 < $GITHUB_WORKSPACE/patches/10_enable_susfs_for_ksu.patch || {
-              echo "KSU patch had fuzz or warnings, checking..."
-              find . -name "*.rej" -exec cat {} + || true
-            }
-            cd ..
+            # Check if KernelSU checkout already bundles SuSFS support
+            if [ -d "KernelSU-Next" ] && grep -q 'CONFIG_KSU_SUSFS' "KernelSU-Next/kernel/Kconfig"; then
+              echo "KernelSU-Next checkout already bundles SuSFS support in-tree; skipping 10_enable_susfs_for_ksu.patch."
+            else
+              echo "Applying KernelSU-Next SuSFS patch..."
+              cd KernelSU-Next
+              patch -p1 --fuzz=3 < $GITHUB_WORKSPACE/patches/10_enable_susfs_for_ksu.patch || true
+              cd ..
+            fi
           fi
 
           # Clean any patch reject or orig files
@@ -203,6 +201,7 @@ jobs:
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_SUS_MAP=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
           EOF
           fi
 
@@ -304,8 +303,8 @@ jobs:
             ### Specifications:
             - **Device:** Nothing Phone (2a) / Nothing Phone (2a) Plus (MT6886 / Dimensity 7200 Pro)
             - **Base Source:** `NothingOSS/android_kernel_5.15_nothing_mt6886` (`${{ inputs.kernel_branch }}`)
-            - **KernelSU-Next:** `${{ inputs.ksu_version }}` (UAPI v5)
-            - **SuSFS:** 2.x (`${{ inputs.susfs_branch }}`)
+            - **KernelSU-Next:** `${{ inputs.ksu_branch }}` (from `${{ inputs.ksu_repo }}`)
+            - **SuSFS:** 2.x
             - **Hook Method:** `${{ inputs.hook_type }}`
             - **Compiler:** Android Clang `${{ inputs.clang_version }}`
             
