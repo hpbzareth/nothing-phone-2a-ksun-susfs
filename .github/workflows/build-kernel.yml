@@ -74,7 +74,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev lz4 cpio kmod git curl \
-            zip unzip file dwarves python3 tar wget jq rsync
+            zip unzip file dwarves python3 tar wget jq rsync xz-utils perl
+          xz --version
 
       - name: Setup Swap Memory
         run: |
@@ -237,6 +238,7 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/kernel
           echo "=== Starting Kernel Compilation ==="
+          export XZ=xz
 
           make -j$(nproc --all) \
             O=out \
