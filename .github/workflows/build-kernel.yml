@@ -121,6 +121,14 @@ jobs:
           echo "Latest commit:"
           git log -1 --oneline
 
+          # Patch gen_kheaders.sh to use system cpio and tar instead of broken prebuilts
+          if [ -f "kernel/gen_kheaders.sh" ]; then
+            echo "Patching kernel/gen_kheaders.sh to use system cpio and tar..."
+            sed -i 's|^cpio=.*|cpio=cpio|; s|^tar=.*|tar=tar|' kernel/gen_kheaders.sh
+            chmod +x kernel/gen_kheaders.sh
+          fi
+          chmod +x tools/build/* 2>/dev/null || true
+
       - name: Integrate KernelSU-Next (${{ inputs.ksu_branch }})
         run: |
           cd $GITHUB_WORKSPACE/kernel
@@ -191,10 +199,14 @@ jobs:
 
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
 
+          # Disable IKHEADERS to avoid packaging errors and save memory
+          sed -i 's/CONFIG_IKHEADERS=y/CONFIG_IKHEADERS=n/' $DEFCONFIG
+
           cat << 'EOF' >> $DEFCONFIG
           # KernelSU-Next Configuration
           CONFIG_KSU=y
           CONFIG_WERROR=n
+          CONFIG_IKHEADERS=n
           EOF
 
           if [ "${{ inputs.enable_susfs }}" = "true" ]; then
